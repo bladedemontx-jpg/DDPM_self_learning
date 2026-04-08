@@ -1,22 +1,32 @@
 #! -*- coding: utf-8 -*-
-# 生成扩散模型DDPM参考代码 (PyTorch版)
-# 用了Pre Norm GAU架构
-# 原始Keras版本参考：https://kexue.fm/archives/9984
+# ============================================================================
+# 生成扩散模型DDPM参考代码2 (PyTorch版) - 改进版
+# ============================================================================
+# 【相对ddpm基线的训练层面改进】
+#   1. 使用UNet2（Pre-Norm + Concatenate风格）代替UNet
+#   2. batch_size从64降为32（因为Concatenate风格参数量更大）
+# 训练理论和噪声调度与ddpm完全相同
+#
+# 【DDPM训练目标】
+#   L = E_{t, x_0, ε} [ ||ε - ε_θ(ᾱ_t x_0 + β̄_t ε, t)||_2² ]
+#
+# 原始Keras版本博客：https://kexue.fm/archives/9152
+# ============================================================================
 
 import os
 import cv2
 import glob
-import math
 import copy
 import numpy as np
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 import warnings
 
 warnings.filterwarnings("ignore")
+
+# 导入UNet模型
+from .unet import *
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -30,13 +40,13 @@ def list_pictures(directory, ext='png'):
 imgs = list_pictures('/root/CelebA-HQ/train/', 'png')
 imgs += list_pictures('/root/CelebA-HQ/valid/', 'png')
 np.random.shuffle(imgs)
-img_size = 128  # 如果只想快速实验，可以改为64
-batch_size = 64  # 如果显存不够，可以降低为32、16，但不建议低于16
-hidden_size = 768
-num_layers = 24
+batch_size = 32  # 比ddpm的64小，因为Concatenate风格的UNet2参数量更大，显存占用更多
+
+# 【噪声调度】与ddpm基线完全相同
+# α_t = √(1 - 0.02t/T), β_t = √(1-α_t²)
+# ᾱ_t = ∏α_s, β̄_t = √(1-ᾱ_t²), σ_t = β_t
 
 # 超参数选择
-T = 1000
 alpha = np.sqrt(1 - 0.02 * np.arange(1, T + 1) / T)
 beta = np.sqrt(1 - alpha**2)
 bar_alpha = np.cumprod(alpha)
@@ -82,12 +92,12 @@ class ImageDataset(Dataset):
 
     def __getitem__(self, idx):
         img = imread(self.img_paths[idx])
-        img = img.transpose(2, 0, 1)
+        img = img.transpose(2, 0, 1)  # HWC -> CHW
         return torch.from_numpy(img)
 
 
 def collate_fn(batch):
-    """自定义collate
+    """自定义collate，加噪并返回 noisy_imgs, steps, noise
     """
     batch_imgs = torch.stack(batch, dim=0)
     batch_steps = torch.randint(0, T, (batch_imgs.shape[0],))
@@ -98,199 +108,6 @@ def collate_fn(batch):
     return batch_noisy_imgs, batch_steps[:, None], batch_noise
 
 
-def sinusoidal_embeddings(pos, dim, base=10000):
-    """手动实现正弦位置编码
-    pos: (L,) 位置序列
-    dim: 编码维度
-    返回: (L, dim)
-    """
-    half_dim = dim // 2
-    emb = math.log(base) / (half_dim - 1)
-    emb = torch.exp(torch.arange(half_dim, dtype=torch.float32, device=pos.device) * -emb)
-    emb = pos[:, None].float() * emb[None, :]
-    emb = torch.cat([torch.sin(emb), torch.cos(emb)], dim=-1)
-    return emb
-
-
-def apply_rotary_pos_emb(x, pos_emb):
-    """应用2D旋转位置编码
-    x: (B, L, D)
-    pos_emb: (1, L, D)
-    """
-    dim = pos_emb.shape[-1]
-    # 将pos_emb拆成cos和sin
-    cos = pos_emb[..., :dim // 2].repeat(1, 1, 2)
-    sin = pos_emb[..., :dim // 2].repeat(1, 1, 2)
-    # 更直接地实现: 将x分成前后两半
-    x1, x2 = x[..., :dim // 2], x[..., dim // 2:dim]
-    # 使用sinusoidal编码做旋转
-    sin_emb = pos_emb[..., :dim // 2]
-    cos_emb = pos_emb[..., dim // 2:dim]
-    out1 = x1 * cos_emb - x2 * sin_emb
-    out2 = x2 * cos_emb + x1 * sin_emb
-    if x.shape[-1] > dim:
-        return torch.cat([out1, out2, x[..., dim:]], dim=-1)
-    return torch.cat([out1, out2], dim=-1)
-
-
-class RMSNorm(nn.Module):
-    """RMS归一化（不减均值，无offset）
-    """
-    def __init__(self, dim):
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(dim))
-
-    def forward(self, x):
-        rms = (x ** 2).mean(dim=-1, keepdim=True).sqrt()
-        return x / (rms + 1e-6) * self.weight
-
-
-class GatedAttentionUnit(nn.Module):
-    """Gated Attention Unit (GAU)
-    参考：https://kexue.fm/archives/8934
-    """
-    def __init__(self, hidden_size, key_size, normalization='softmax'):
-        super().__init__()
-        self.hidden_size = hidden_size
-        self.key_size = key_size
-        self.normalization = normalization
-
-        # UV门控 + q,k
-        self.to_uv = nn.Linear(hidden_size // 2, hidden_size * 2 + key_size * 2, bias=False)
-        self.to_out = nn.Linear(hidden_size, hidden_size // 2, bias=False)
-
-        # 缩放因子
-        self.scale = key_size ** -0.5
-
-    def forward(self, x, pos_emb):
-        """
-        x: (B, L, D/2)  输入（经过LayerNorm）
-        pos_emb: (1, L, key_size*2) 2D RoPE
-        """
-        B, L, _ = x.shape
-
-        # 计算u, v, q, k
-        uvqk = self.to_uv(x)
-        u, v, q, k = uvqk.split([self.hidden_size, self.hidden_size, self.key_size, self.key_size], dim=-1)
-        u = F.silu(u)
-        v = F.silu(v)
-
-        # 应用RoPE到q, k
-        q = apply_rotary_pos_emb(q, pos_emb[:, :L, :self.key_size])
-        k = apply_rotary_pos_emb(k, pos_emb[:, :L, :self.key_size])
-
-        # 注意力
-        qk = torch.bmm(q, k.transpose(1, 2)) * self.scale  # (B, L, L)
-        if self.normalization == 'softmax':
-            attn = F.softmax(qk, dim=-1)
-        else:
-            attn = F.relu(qk) ** 2
-
-        # 门控输出
-        out = torch.bmm(attn, v)  # (B, L, hidden)
-        out = u * out
-        out = self.to_out(out)
-        return out
-
-
-class GAUBlock(nn.Module):
-    """GAU块: LayerNorm + GAU + 残差
-    """
-    def __init__(self, hidden_size, key_size):
-        super().__init__()
-        self.norm = RMSNorm(hidden_size)
-        self.gau = GatedAttentionUnit(hidden_size, key_size, 'softmax')
-
-    def forward(self, x, pos_emb):
-        xi = x
-        x = self.norm(x)
-        x = self.gau(x, pos_emb)
-        return xi + x
-
-
-class GAUDenoisingModel(nn.Module):
-    """基于GAU的去噪模型
-    将图像打成8x8的patch，然后用GAU处理
-    """
-    def __init__(self):
-        super().__init__()
-        self.patch_size = 8
-        patch_dim = self.patch_size * self.patch_size * 3  # 192
-        self.num_patches = (img_size // self.patch_size) ** 2
-
-        self.patch_proj = nn.Linear(patch_dim, hidden_size, bias=False)
-        self.t_embed = nn.Embedding(T, hidden_size)
-
-        self.blocks = nn.ModuleList([
-            GAUBlock(hidden_size, 128)
-            for _ in range(num_layers)
-        ])
-
-        self.final_norm = RMSNorm(hidden_size)
-        self.unpatch_proj = nn.Linear(hidden_size, patch_dim, bias=False)
-
-    def _make_rope_2d(self, device):
-        """生成2D RoPE位置编码
-        """
-        w = img_size // self.patch_size
-        pos = torch.arange(w * w, device=device)
-        pos1 = pos // w
-        pos2 = pos % w
-        emb1 = sinusoidal_embeddings(pos1, 64, 1000)
-        emb2 = sinusoidal_embeddings(pos2, 64, 1000)
-        return torch.cat([emb1, emb2], dim=-1).unsqueeze(0)  # (1, L, 128)
-
-    def _patchify(self, x):
-        """将图像转为patch序列
-        x: (B, 3, H, W) -> (B, num_patches, patch_dim)
-        """
-        B, C, H, W = x.shape
-        p = self.patch_size
-        x = x.view(B, C, H // p, p, W // p, p)
-        x = x.permute(0, 2, 4, 3, 5, 1)  # (B, H//p, W//p, p, p, C)
-        x = x.reshape(B, self.num_patches, -1)
-        return x
-
-    def _unpatchify(self, x):
-        """将patch序列还原为图像
-        x: (B, num_patches, patch_dim) -> (B, 3, H, W)
-        """
-        B = x.shape[0]
-        p = self.patch_size
-        h = w = img_size // p
-        x = x.view(B, h, w, p, p, 3)
-        x = x.permute(0, 5, 1, 3, 2, 4)  # (B, C, h, p, w, p)
-        x = x.reshape(B, 3, img_size, img_size)
-        return x
-
-    def forward(self, x, t_idx):
-        """
-        x: (B, 3, H, W)
-        t_idx: (B, 1)
-        """
-        # Patchify
-        x = self._patchify(x)  # (B, L, patch_dim)
-        x = self.patch_proj(x)  # (B, L, hidden)
-
-        # 时间编码
-        t = self.t_embed(t_idx.squeeze(-1))  # (B, hidden)
-        x = x + t.unsqueeze(1)
-
-        # 2D RoPE
-        pos_emb = self._make_rope_2d(x.device)
-
-        # GAU blocks
-        for block in self.blocks:
-            x = block(x, pos_emb)
-
-        x = self.final_norm(x)
-        x = self.unpatch_proj(x)  # (B, L, patch_dim)
-
-        # Unpatchify
-        x = self._unpatchify(x)  # (B, 3, H, W)
-        return x
-
-
 def l2_loss(y_true, y_pred):
     """用l2距离为损失，不能用mse代替
     """
@@ -298,7 +115,7 @@ def l2_loss(y_true, y_pred):
 
 
 # 构建模型
-model = GAUDenoisingModel().to(device)
+model = UNet2().to(device)
 print(f'模型参数量: {sum(p.numel() for p in model.parameters()):,}')
 
 # EMA模型

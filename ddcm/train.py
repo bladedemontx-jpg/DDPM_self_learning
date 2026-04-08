@@ -1,28 +1,52 @@
 #! -*- coding: utf-8 -*-
+# ============================================================================
 # DDCM（Denoising Diffusion Codebook Models）参考代码 (PyTorch版)
-# 在DDPM上修改，不用改变训练，只修改采样过程
+# ============================================================================
+# 【核心改进】用Codebook替换采样中的随机噪声，不改变训练
+#
+# 【DDCM理论】
+#   DDPM采样: x_{t-1} = (x_t - β_t²/β̄_t · ε_θ) / α_t + σ_t · z,  z ~ N(0,I)
+#   DDCM采样: x_{t-1} = (x_t - β_t²/β̄_t · ε_θ) / α_t + σ_t · c_t^(k)
+#   其中 c_t^(k) 是从Codebook中随机选取或按相似度选取的码字
+#
+# 【改进优势】
+#   1. 采样：用码本替代随机噪声，可以控制采样多样性
+#   2. 编码：可以将图像编码为码本索引序列，实现图像压缩
+#   3. 不需要额外训练，直接使用预训练的DDPM模型
+#
 # 原始Keras版本博客：https://kexue.fm/archives/9245
+# ============================================================================
 
-from ddpm2 import *  # 加载训练好的模型
 
+# 导入ddpm2的训练代码（包含模型和预训练权重）
+from ddpm2.train import *
+
+# 【Codebook】每个时间步预分配K个噪声向量，代替采样时的随机噪声
 K_codebook = 64  # 每步的Codebook大小
+# codebook[t][k] 是时间步t的第k个噪声向量，形状同图像
 codebook = np.random.randn(T + 1, K_codebook, 3, img_size, img_size).astype('float32')
 
 
 @torch.no_grad()
 def sample_ddcm(path, n=4, use_ema=True):
-    """随机采样函数
+    """【DDCM采样】用Codebook中随机选取的码字替代随机噪声
+    DDPM:   + σ_t · z          (z ~ N(0,I))
+    DDCM:   + σ_t · c_t^(k)    (k随机选取)
     """
     net = ema_model if use_ema else model
     net.eval()
+    # 【起始点】从codebook[T]中随机选取初始噪声（而非DDPM的z~N(0,I)）
     z_samples = codebook[T][np.random.choice(K_codebook, size=n**2)].copy()
     for t_step in tqdm(range(T), ncols=0):
         t_step = T - t_step - 1
         bt = torch.full((z_samples.shape[0], 1), t_step, dtype=torch.long, device=device)
         z_tensor = torch.from_numpy(z_samples).to(device)
-        pred = net(z_tensor, bt).cpu().numpy()
+        pred = net(z_tensor, bt).cpu().numpy()  # 预测噪声 ε_θ(x_t, t)
+        # DDPM去噪步骤: x = (x - β²/β̄ · ε_θ) / α
         z_samples -= beta[t_step]**2 / bar_beta[t_step] * pred
         z_samples /= alpha[t_step]
+        # 【DDCM核心】用codebook中随机选取的码字替代随机噪声
+        # DDPM: + σ_t · N(0,I)     DDCM: + σ_t · codebook[t][k]
         z_samples += codebook[t_step][np.random.choice(K_codebook, size=n**2)] * sigma[t_step]
     x_samples = np.clip(z_samples, -1, 1)
     x_samples_hwc = x_samples.transpose(0, 2, 3, 1)
@@ -37,7 +61,12 @@ def sample_ddcm(path, n=4, use_ema=True):
 
 @torch.no_grad()
 def encode_ddcm(path, n=4, use_ema=True):
-    """随机选一些图片，进行编码和重构
+    """【DDCM编码】将真实图像编码为码本索引序列，并重构
+    编码过程:
+      1. 在每个时间步t，用模型估计x_0: x̂_0 = (x_t - β̄_t · ε_θ) / ᾱ_t
+      2. 计算每个码字与残差(x_real - x̂_0)的相似度
+      3. 选择最相似的码字，使重构更接近原图
+    这样可以把一张图像压缩为T个码本索引（每个log2(K)bit）
     """
     net = ema_model if use_ema else model
     net.eval()
@@ -49,13 +78,14 @@ def encode_ddcm(path, n=4, use_ema=True):
         t_step = T - t_step - 1
         bt = torch.full((z_samples.shape[0], 1), t_step, dtype=torch.long, device=device)
         z_tensor = torch.from_numpy(z_samples).to(device)
-        pred = net(z_tensor, bt).cpu().numpy()
+        pred = net(z_tensor, bt).cpu().numpy()  # 预测噪声 ε_θ(x_t, t)
+        # 估计x_0: x̂_0 = (x_t - β̄_t · ε_θ) / ᾱ_t
         x0 = (z_samples - bar_beta[t_step] * pred) / bar_alpha[t_step]
-        # 计算相似度: codebook[t_step] shape: (K, 3, H, W), x_samples - x0 shape: (B, 3, H, W)
-        # sims[k, b] = sum over (c, h, w) of codebook[t_step][k] * (x_samples_chw[b] - x0[b])
+        # 【编码核心】计算码字与残差的相似度，选择最佳码字
+        # sim(k,b) = <codebook[t][k], x_real[b] - x̂_0[b]>
         x_diff = np.array(x_samples_chw) - x0  # (B, 3, H, W)
-        sims = np.einsum('kcwh,bcwh->kb', codebook[t_step], x_diff)
-        idxs = sims.argmax(0)
+        sims = np.einsum('kcwh,bcwh->kb', codebook[t_step], x_diff)  # 向量内积作为相似度
+        idxs = sims.argmax(0)  # 选取与残差最相似的码字索引
         z_samples -= beta[t_step]**2 / bar_beta[t_step] * pred
         z_samples /= alpha[t_step]
         z_samples += codebook[t_step][idxs] * sigma[t_step]
